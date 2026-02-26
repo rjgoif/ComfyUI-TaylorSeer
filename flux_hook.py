@@ -343,6 +343,45 @@ def taylorseer_lite_flux_forward(
         pe = None
 
     blocks_replace = patches_replace.get("dit", {})
+
+    # --- Per-seq-len cache routing ---
+    # img has already been projected by img_in; its seq dim reflects the actual token
+    # count (with or without reference latent tokens prepended). When conditioning
+    # switches (reference+text vs text-only), seq_len changes mid-run.  Route to the
+    # matching cache/current pair and wipe stale Taylor factors on every seq_len switch.
+    _seq_len = img.shape[1]
+    _prev_seq_len = getattr(self, '_taylorseer_seq_len', None)
+    _cache_attr   = f'_taylorseer_cache_{_seq_len}'
+    _current_attr = f'_taylorseer_current_{_seq_len}'
+    if not hasattr(self, _cache_attr):
+        # First time this seq_len is seen — fresh init.
+        _cd, _cur = cache_init_flux(
+            self.cache_dic['fresh_threshold'],
+            self.cache_dic['max_order'],
+            self.cache_dic['first_enhance'],
+            self.cache_dic['last_enhance'],
+            self.current['num_steps'],
+        )
+        setattr(self, _cache_attr, _cd)
+        setattr(self, _current_attr, _cur)
+    elif _prev_seq_len is not None and _prev_seq_len != _seq_len:
+        # Seq len changed — flush stored Taylor factors so derivative_approximation
+        # starts clean, and reset step counters so cal_type sees this as a fresh run.
+        _cd  = getattr(self, _cache_attr)
+        _cur = getattr(self, _current_attr)
+        for _stream_d in _cd['cache'][-1].values():
+            for _layer_d in _stream_d.values():
+                for _mod_key in list(_layer_d.keys()):
+                    _layer_d[_mod_key] = {}
+        _cur['step'] = 0
+        _cur['current_activated_step'] = 0
+        _cur['previous_activated_step'] = 0
+        _cd['cache_counter'] = 0
+    self._taylorseer_seq_len = _seq_len
+    self.cache_dic = getattr(self, _cache_attr)
+    self.current   = getattr(self, _current_attr)
+    # --- end routing ---
+
     cal_type(cache_dic=self.cache_dic, current=self.current)
     self.current['stream'] = 'final_stream'
     self.current['layer'] = 0
